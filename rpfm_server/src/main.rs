@@ -61,9 +61,11 @@ use rmcp::transport::streamable_http_server::{session::local::LocalSessionManage
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use rmcp::ServiceExt;
 
 use rpfm_ipc::helpers::SessionInfo;
 use rpfm_ipc::settings_keys::{ANONYMOUS_TELEMETRY_ID, ENABLE_CRASH_REPORTS, ENABLE_USAGE_TELEMETRY};
@@ -125,6 +127,8 @@ const DEFAULT_PORT: u16 = 45127;
 //-------------------------------------------------------------------------------//
 
 /// Process entry point.
+
+/// Process entry point.
 ///
 /// Initialises the Sentry/telemetry guard, primes the telemetry toggles from
 /// persisted settings, builds the [`session::SessionManager`], wires the
@@ -174,6 +178,19 @@ async fn main() {
     // and start the background cleanup task for expired sessions.
     let session_manager: Arc<SessionManager> = Arc::new(SessionManager::default());
     SessionManager::start_cleanup_task(session_manager.clone());
+
+    // Check for MCP Stdio mode.
+    let args: Vec<String> = env::args().collect();
+    if args.contains(&"--mcp-stdio".to_string()) {
+        info!("Starting RPFM Server in MCP Stdio mode...");
+        let mcp_server = McpServer::new(session_manager.clone());
+        
+        // Use the official rmcp Stdio transport
+        if let Err(e) = mcp_server.serve(rmcp::transport::stdio()).await {
+            warn!("MCP Stdio server encountered an error: {e}");
+        }
+        return;
+    }
 
     // Create the MCP service. All MCP clients share one session, got from the manager on each call.
     let sm = session_manager.clone();
