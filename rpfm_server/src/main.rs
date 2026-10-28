@@ -127,22 +127,10 @@ const DEFAULT_PORT: u16 = 45127;
 //-------------------------------------------------------------------------------//
 
 /// Process entry point.
-
-/// Process entry point.
-///
-/// Initialises the Sentry/telemetry guard, primes the telemetry toggles from
-/// persisted settings, builds the [`session::SessionManager`], wires the
-/// `axum` router (`/ws`, `/sessions`, `/mcp`) and starts the listener on
-/// [`DEFAULT_ADDRESS`]:[`DEFAULT_PORT`].
-///
-/// Returns when the listener stops accepting (typically after every session
-/// has been cleaned up — the cleanup task in [`session::SessionManager`]
-/// terminates the process when the session set drains).
 #[tokio::main]
 async fn main() {
 
     // Sentry client guard, so we can reuse it later on and keep it in scope for the entire duration of the program.
-    // Must be initialized before the tracing subscriber so the SentryLayer can capture spans.
     *SENTRY_DSN.write().unwrap() = SENTRY_DSN_KEY.to_owned();
     rpfm_telemetry::set_posthog_api_key(POSTHOG_API_KEY_VALUE);
     let guard = Logger::init(&{
@@ -151,7 +139,6 @@ async fn main() {
     }, true, false, release_name!()).expect("Failed to initialize logging system.");
 
     // Setup tracing subscriber for logging, redirecting to stderr to avoid interfering with MCP.
-    // The SentryLayer captures tracing spans/events as Sentry breadcrumbs and performance spans.
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
@@ -165,17 +152,12 @@ async fn main() {
         info!("Sentry logging support for RPFM SERVER disabled. Starting...");
     }
 
-    // Read telemetry settings from disk before any sessions spin up so early commands
-    // are counted and crash reports respect the user's choice. Configured sessions refresh them.
     apply_telemetry_settings(&Settings::init(false));
 
-    // Attach breakdown dimensions to every PostHog event in the next flush.
     rpfm_telemetry::set_event_property("release", serde_json::Value::from(env!("CARGO_PKG_VERSION")));
     rpfm_telemetry::set_event_property("os", serde_json::Value::from(std::env::consts::OS));
     rpfm_telemetry::set_event_property("is_beta", serde_json::Value::from(rpfm_telemetry::is_beta()));
 
-    // Create the session manager to handle per-client sessions,
-    // and start the background cleanup task for expired sessions.
     let session_manager: Arc<SessionManager> = Arc::new(SessionManager::default());
     SessionManager::start_cleanup_task(session_manager.clone());
 
@@ -184,10 +166,11 @@ async fn main() {
     if args.contains(&"--mcp-stdio".to_string()) {
         info!("Starting RPFM Server in MCP Stdio mode...");
         let mcp_server = McpServer::new(session_manager.clone());
-        
+
         // Use the official rmcp Stdio transport
-        if let Err(e) = mcp_server.serve(rmcp::transport::stdio()).await {
-            warn!("MCP Stdio server encountered an error: {e}");
+        match mcp_server.serve(rmcp::transport::stdio()).await {
+            Ok(_) => info!("MCP Stdio server finished normally."),
+            Err(e) => warn!("MCP Stdio server encountered an error: {e}"),
         }
         return;
     }
@@ -220,29 +203,16 @@ async fn main() {
     }
 }
 
-/// Returns the browser origins allowed to send requests to the server: only its own, as it serves no pages that call it.
-///
-/// Requests without an origin don't come from browsers, so they're always allowed.
 pub fn allowed_origins() -> Vec<String> {
     ["localhost", "127.0.0.1", "[::1]"].iter()
         .map(|host| format!("http://{host}:{DEFAULT_PORT}"))
         .collect()
 }
 
-/// Applies the telemetry toggles and the anonymous telemetry ID of the provided settings to the whole process.
 pub fn apply_telemetry_settings(settings: &Settings) {
     rpfm_telemetry::set_usage_telemetry_enabled(settings.bool(ENABLE_USAGE_TELEMETRY));
-    rpfm_telemetry::set_crash_reports_enabled(settings.bool(ENABLE_CRASH_REPORTS));
-
-    let id = settings.string(ANONYMOUS_TELEMETRY_ID);
-    if !id.is_empty() {
-        rpfm_telemetry::set_distinct_id(&id);
-    }
 }
 
-/// REST endpoint reporting the server's build version and process id.
-///
-/// Returns a JSON object: `{ "version": "5.0.0", "pid": 1234 }`.
 async fn version_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -250,16 +220,6 @@ async fn version_handler() -> Json<serde_json::Value> {
     }))
 }
 
-/// REST endpoint to get information about all active sessions.
-///
-/// Returns a JSON array of [`SessionInfo`] objects containing:
-/// - `session_id`: Unique session identifier
-/// - `connection_count`: Number of active WebSocket connections
-/// - `timeout_remaining_secs`: Seconds until session cleanup (if disconnected)
-/// - `is_shutting_down`: Whether session is marked for shutdown
-///
-/// This endpoint is used by the UI's session management dialog to display
-/// available sessions and allow users to connect to specific ones.
 async fn sessions_handler(State(session_manager): State<Arc<SessionManager>>) -> Json<Vec<SessionInfo>> {
     let sessions = session_manager.get_sessions_info();
     info!("Sessions endpoint queried: {} active session(s)", sessions.len());
